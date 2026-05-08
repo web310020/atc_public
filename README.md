@@ -36,14 +36,14 @@ ATC 是面向 O-RAN 网络切片、在 asynchronous telemetry 场景下的层级
 
 ## 复现 paper 结果
 
-| 内容                   | 命令                                                                              | 大约耗时 (CPU) |
-|------------------------|-----------------------------------------------------------------------------------|---------------|
-| K=1 主结果             | `python run_final_evaluation.py`                                                  | ~4 h          |
-| K=3 主结果 (50 seeds)  | `python run_k3_seedbump_workers8.py --workers 8`                                  | ~12 h         |
-| K=5 probe (30 seeds)   | `python run_k5_probe_workers8.py --workers 2`                                     | ~6 h          |
-| Ablation 表            | `python train_l3_ablations.py && python run_l3_ablations_eval.py`                 | ~8 h          |
-| Sensitivity 扫描       | `python run_supplementary_experiments.py --workers 4`                             | ~6 h          |
-| Latency CDF            | `python core/run_latency_cdf.py --output experiments/latency_cdf --workers 1`     | ~30 min       |
+| 内容                   | 命令                                                                              |
+|------------------------|-----------------------------------------------------------------------------------|
+| K=1 主结果             | `python run_final_evaluation.py`                                                  |
+| K=3 主结果 (50 seeds)  | `python run_k3_seedbump_workers8.py --workers 8`                                  |
+| K=5 probe (30 seeds)   | `python run_k5_probe_workers8.py --workers 2`                                     |
+| Ablation 表            | `python train_l3_ablations.py && python run_l3_ablations_eval.py`                 |
+| Sensitivity 扫描       | `python run_supplementary_experiments.py --workers 4`                             |
+| Latency CDF            | `python core/run_latency_cdf.py --output experiments/latency_cdf --workers 1`     |
 
 每个 run 的输出落在 `experiments/<run_name>/` 下.
 
