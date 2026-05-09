@@ -17,13 +17,16 @@ ATC = O-RAN 网络切片在 stale telemetry 下的层级 controller:
 
 ## 主要实验
 
-    # K=3, 50 seeds
+    # K=1 主结果 (Tables III/V/VI + Fig 2/3 数据)
+    python run_final_evaluation.py
+
+    # K=3 主结果 (50 seeds, Table VII + Fig 4 top)
     python run_k3_seedbump_workers1.py --workers 1
-    
-    # K=5 probe (30 seeds)
+
+    # K=5 probe (30 seeds, Fig 4 bottom)
     python run_k5_probe_workers1.py --workers 1
-    
-    # Ablation
+
+    # Ablation (Table)
     python train_l3_ablations.py && python run_l3_ablations_eval.py
 
 输出落在 `experiments/<run_name>/`.
