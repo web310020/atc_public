@@ -14,18 +14,14 @@ Lagrangian 关掉, env 和 template 也一样).
 
 Usage:
     # 默认: 2 mode x 50 seed = 100 jobs, 8 worker, 每 job 120K step
-    python run_k3_baseline_pool_overnight.py --workers 8 \
+    python run_k3_baseline_pool_overnight.py --workers 1 \
         --output experiments/<run_name>/
-
-    # Smoke test (5 seed, 30K step, wall ~5-10 min)
-    python run_k3_baseline_pool_overnight.py --seed-end 4 --steps 30000 \
-        --workers 4 --output experiments/<smoke>/
 
     # Run only the oracle (FullInfo-PPO)
     python run_k3_baseline_pool_overnight.py --modes oracle
 
 Hardware: 1 CPU process per worker, PyTorch CPU mode (no GPU). 100 jobs
-across 8 workers ~ 1-2 h wall, ~10-15 GB RAM.
+across 8 workers  , ~10-15 GB RAM.
 """
 from __future__ import annotations
 

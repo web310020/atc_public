@@ -7,11 +7,6 @@
   C. beta 敏感性扫描
   D. Latency CDF 测量
 
-预估耗时:
-  串行:        ~12-18 h
-  4 worker:    ~4-8 h
-  6 worker:    ~3-6 h
-
 Usage:
     python run_supplementary_experiments.py --workers 4
     python run_supplementary_experiments.py --workers 6 --skip latency_cdf

@@ -1,30 +1,10 @@
 """
-run_safeslice_real_baseline.py — Real SafeSlice (CPO descendant) baseline at K=3 + K=5
+SafeSlice (CPO-style) baseline runner @ K=3 + K=5.
 
-Faithful [SafeSlice_2025] reproduction using GlobalSafeSliceLagrangian in
-core/k3_dirichlet_ppo.py: single global lambda ascending on aggregate (mean)
-per-slice violation, mutually exclusive with ATC's per-slice mu_k. Under stale
-telemetry (D=200ms) the observation-conditioned constraint signal degenerates
-and trajectory tracks Vanilla-PPO — empirically validating the paper section
-II.B claim about single-Lagrangian formulations.
+单全局 lambda 在 aggregate (mean) per-slice violation 上 dual ascent —
+和 ATC 的 per-slice mu_k 互斥. K=3 50 seeds + K=5 30 seeds, 各 120K steps.
 
-Setup:
-- K=3 template A (URLLC/eMBB/mMTC, sla_budget=[0.01, 0.05, 0.10]) x 50 seeds
-- K=5 template K5_A (URLLC/V2X/eMBB/mMTC/IoT_burst) x 30 seeds
-- 120K K3DirichletPPO steps per training (matches baseline pool standard)
-- Per-K dir to mirror k3 baseline pool / k5 multiseed structure
-
-Usage (one-liner; default workers=2):
-    python run_safeslice_real_baseline.py --workers 2
-
-Expected runtime (workers=2):
-- K=3: 50 seeds x ~90sec / 2 workers = ~37 min
-- K=5: 30 seeds x ~90sec / 2 workers = ~22 min
-- Total: ~60 min wall
-
-Output:
-  experiments/safeslice_real_k3_<timestamp>/runs/safeslice_seed{0..49}/...
-  experiments/safeslice_real_k5_<timestamp>/runs/safeslice_seed{0..29}/...
+用法: python run_safeslice_real_baseline.py --workers 2
 """
 from __future__ import annotations
 
@@ -44,7 +24,6 @@ from run_k3_experiment import run_one  # noqa: E402
 
 
 def _worker_fn(job: dict) -> dict:
-    """Real SafeSlice training: GlobalSafeSliceLagrangian on aggregate violation."""
     return run_one(
         mode="safeslice",
         template=job["template"],
@@ -52,8 +31,8 @@ def _worker_fn(job: dict) -> dict:
         total_steps=job["steps"],
         use_kalman=False,
         out_dir=Path(job["out_dir"]),
-        use_lagrangian=False,        # disable per-slice (ATC's mechanism)
-        safeslice_mode=True,         # enable global single-lambda Lagrangian
+        use_lagrangian=False,        # 关 per-slice (ATC 机制)
+        safeslice_mode=True,         # 开 single-lambda global Lagrangian
         normalize_per_slice_rewards=False,
         lr_dual=job.get("lr_dual", 1e-3),
         alpha_floor=job.get("alpha_floor", 1.0),
@@ -62,7 +41,6 @@ def _worker_fn(job: dict) -> dict:
 
 def _run_one_K(K_label: str, template: str, seeds: list, steps: int,
                workers: int, parent_out: Path) -> Path:
-    """Run safeslice at one K value, return output dir."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = parent_out / f"safeslice_real_{K_label}_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +57,7 @@ def _run_one_K(K_label: str, template: str, seeds: list, steps: int,
 
     config = {
         "experiment": f"safeslice_real_{K_label}",
-        "purpose": "Real [SafeSlice_2025] reproduction (CPO descendant, single global lambda)",
+        "purpose": "SafeSlice (CPO-style) reproduction with single global lambda",
         "template": template,
         "n_seeds": len(seeds),
         "seeds": seeds,

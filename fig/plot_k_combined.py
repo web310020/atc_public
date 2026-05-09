@@ -5,8 +5,8 @@ K=3 + K=5 per-slice violation 合并图 (单列 2 row).
 下排: K=5 (URLLC / V2X / eMBB / mMTC / IoT_burst, 10 seeds, safety
       threshold 2.5%)
 
-数据从 experiments/ 下自动 glob (run_k3_seedbump_workers8.py 和
-run_k5_probe_workers8.py 跑出来的 dir).
+数据从 experiments/ 下自动 glob (run_k3_seedbump_workers1.py 和
+run_k5_probe_workers1.py 跑出来的 dir).
 
 Usage:
     python -m fig.plot_k_combined

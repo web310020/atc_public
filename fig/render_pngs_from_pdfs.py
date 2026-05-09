@@ -1,45 +1,48 @@
 """
-按 paper 里的实际渲染宽度 (\\includegraphics 之后那个尺寸) 把每个 PDF
-图重新栅格成 PNG, 保证 PNG 里的字号和比例跟正稿里看到的一致.
+PDF → PNG 重栅格 (按 paper 实际渲染宽度算 dpi target).
 
-绘图脚本里 source font size 故意设得偏大, 因为 LaTeX 里会再 scale 一次
-(\\includegraphics width=...). matplotlib 直接导 PNG (figsize x dpi)
-跳过了这层 scale, 所以独立看 PNG 字会显得很大. 这个脚本修正这一点.
-
-Usage:
-    python -m fig.render_pngs_from_pdfs
+避开 matplotlib default + LaTeX scaling 双重缩放导致 PNG 字号偏大.
+用法: python -m fig.render_pngs_from_pdfs
 """
 import os
 import fitz  # PyMuPDF
 
-# IEEE conf two-column page (sig-alternate / IEEEtran):
-#   textwidth   = 7.16 in (full 2-col width, used by figure*)
-#   linewidth   = 3.49 in (single column, used by figure)
-# Constants below are conservative; pixel deltas <5% don't change visual.
+# IEEE 2-col page (IEEEtran):
+#   textwidth = 7.16 in (figure* 双栏)
+#   linewidth = 3.49 in (figure 单栏)
 LINEWIDTH_IN = 3.49
 TEXTWIDTH_IN = 7.16
 
-# Per-figure target rendered width matched against the \includegraphics
-# directives in the LaTeX source. Tuple is (target_width_in_inches, label).
+# Per-figure 目标 rendered 宽度 (匹配 \includegraphics)
 TARGETS = {
-    # paper 里实际用到的图: 1 张架构示意 + 3 张数据图
-    "fig_atc_architecture":     (LINEWIDTH_IN, r"\linewidth (system architecture, hand-drawn)"),
-    "fig_empirical_trap":       (LINEWIDTH_IN, r"\linewidth (empirical Conservatism Trap)"),
-    "fig_perf_distributions":   (LINEWIDTH_IN, r"\linewidth (perf distributions 2-panel)"),
-    "fig_k_combined":           (LINEWIDTH_IN, r"\linewidth (K=3+K=5 per-slice 2-row)"),
+    # 主图 (1 system arch + 5 data figs)
+    "fig_atc_architecture":       (LINEWIDTH_IN,            r"\linewidth single col, Fig 1 system arch"),
+    "fig_empirical_trap":         (LINEWIDTH_IN,            r"\linewidth single col, Fig 2 empirical trap"),
+    "fig_perf_distributions":     (LINEWIDTH_IN,            r"\linewidth single col, Fig 3 perf distributions"),
+    "fig_k_combined":             (LINEWIDTH_IN,            r"\linewidth single col, Fig 4 K=3+K=5 combined"),
+    "fig_pareto_front":           (LINEWIDTH_IN,            r"\linewidth single col, Fig 5 Pareto front"),
 
-    # run_joint_sweep_v2 输出的 1x5 panel 大图 (用作 plot_empirical_trap 的数据源)
-    "fig_joint_landscape_1x4":  (TEXTWIDTH_IN, r"1.0\linewidth (full 2-col, figure*)"),
+    # 旧版 K=3 / K=5 per-slice 拆开版 (back-compat)
+    "fig_k3_perslice":            (LINEWIDTH_IN,            r"\linewidth K=3 per-slice"),
+    "fig_k5_perslice":            (LINEWIDTH_IN,            r"\linewidth K=5 per-slice"),
+
+    # 历史 entries (PDF 可能仍在 disk, 但 canonical_tex 已不引)
+    "fig_theory_trap":            (LINEWIDTH_IN,            r"\linewidth single col"),
+    "fig_fidelity":               (0.244 * TEXTWIDTH_IN,    r"0.244\textwidth subfig"),
+    "fig_saturation_cdf":         (0.244 * TEXTWIDTH_IN,    r"0.244\textwidth subfig"),
+    "fig_violation_depth":        (0.244 * TEXTWIDTH_IN,    r"0.244\textwidth subfig"),
+    "fig_scores":                 (0.244 * TEXTWIDTH_IN,    r"0.244\textwidth subfig"),
+    "fig_joint_landscape_1x4":    (TEXTWIDTH_IN,            r"1.0\linewidth in figure* (full 2-col)"),
+    "fig_sensitivity_analysis":   (0.9 * LINEWIDTH_IN,      r"0.9\linewidth single col"),
 }
 
-DPI = 300  # output PNG DPI; 300 = print-quality, gives crisp on-screen view
+DPI = 300
 
 PAPER_FIG_DIR = "paper_draft/figures" if os.path.isdir("paper_draft/figures") \
     else os.path.join("..", "paper_draft", "figures")
 
 
 def render_one(base_name: str, target_width_in: float, src_label: str) -> bool:
-    """Rasterize PDF at target width inches x DPI; overwrite same-name PNG."""
     pdf_path = os.path.join(PAPER_FIG_DIR, base_name + ".pdf")
     png_path = os.path.join(PAPER_FIG_DIR, base_name + ".png")
 
@@ -74,7 +77,7 @@ def render_one(base_name: str, target_width_in: float, src_label: str) -> bool:
 
 def main():
     print(f">>> Rendering PNGs from PDFs in {PAPER_FIG_DIR}")
-    print(f">>> Target: paper-rendered size (per \\includegraphics in the LaTeX source)")
+    print(f">>> Target: paper-rendered size (per \\includegraphics in canonical .tex)")
     print(f">>> DPI: {DPI}")
     print()
 

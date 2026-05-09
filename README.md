@@ -18,10 +18,10 @@ ATC = O-RAN 网络切片在 stale telemetry 下的层级 controller:
 ## 主要实验
 
     # K=3, 50 seeds
-    python run_k3_seedbump_workers8.py --workers 1
+    python run_k3_seedbump_workers1.py --workers 1
     
     # K=5 probe (30 seeds)
-    python run_k5_probe_workers8.py --workers 1
+    python run_k5_probe_workers1.py --workers 1
     
     # Ablation
     python train_l3_ablations.py && python run_l3_ablations_eval.py

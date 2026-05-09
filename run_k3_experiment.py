@@ -1,22 +1,9 @@
 #!/usr/bin/env python
 # run_k3_experiment.py
 # ============================================================
-# K=3 PROMOTE-or-FALLBACK decision experiment for the Belief paper.
-# Target decision date: 2026-04-26 evening.
-#
-# What it does:
-#   1. Trains the ATC ("proposed") mode with Dirichlet PPO + per-slice
-#      Lagrangian on a K=3 slice configuration (Template C for sanity,
-#      Template A for the real decision run).
-#   2. Trains a Vanilla-PPO baseline with the same Dirichlet policy but no
-#      Belief Engine / Trust Fusion / adaptive telemetry (this isolates the
-#      ATC mechanism — the RL stack is identical so the comparison is fair).
-#   3. Evaluates both over a deterministic eval set and reports per-slice
-#      violation rates, aggregate U, and a DECISION block (PROMOTE / FALLBACK /
-#      AMBIGUOUS) against the criteria defined in
-#      `paper_draft/20260424_new/Belief_K3_experiment_design_20260424.md`.
-#
-# Output: JSON + markdown report in experiments/k3_<timestamp>/
+# K=3 PROMOTE / FALLBACK / AMBIGUOUS 决策 runner.
+# 训 ATC ("proposed") + Vanilla-PPO 各一份, eval 完按 most-constrained slice
+# violation ratio + aggregate U gap 输出决策, 写 REPORT.md / MANIFEST.md.
 # ============================================================
 
 import argparse
@@ -38,28 +25,21 @@ from core.k3_env import make_env, TEMPLATES
 from core.k3_dirichlet_ppo import K3DirichletPPO
 
 
-# ============================================================
-# Decision criteria — copied verbatim from experiment design brief
-# ============================================================
+# ---------- 决策阈值 ----------
 
 SUCCESS_CRITERIA = {
-    # Most-constrained slice violation rate: ATC at least 2x lower than Vanilla
-    "most_constrained_ratio": 2.0,
-    # Aggregate U: ATC within 10% of Vanilla
-    "agg_u_tolerance": 0.10,
-    # Training stability: all seeds must produce finite metrics
-    "min_stable_seeds_fraction": 1.0,  # 3/3 seeds must converge
+    "most_constrained_ratio": 2.0,         # ATC most-constrained viol 至少比 Vanilla 低 2x
+    "agg_u_tolerance": 0.10,               # ATC aggregate U 在 Vanilla 10% 之内
+    "min_stable_seeds_fraction": 1.0,      # 全 seeds 都收敛
 }
 
 AMBIGUOUS_CRITERIA = {
-    "min_stable_seeds_fraction": 2.0 / 3.0,   # 2/3 seeds ok -> AMBIGUOUS
-    "most_constrained_ratio_min": 1.3,        # >=1.3x but <2x -> AMBIGUOUS
+    "min_stable_seeds_fraction": 2.0 / 3.0,
+    "most_constrained_ratio_min": 1.3,
 }
 
 
-# ============================================================
-# Training & evaluation for a single (mode, seed)
-# ============================================================
+# ---------- 单 (mode, seed) 训 + eval ----------
 
 def run_one(mode: str, template: str, seed: int, total_steps: int,
             use_kalman: bool, out_dir: Path,
@@ -107,28 +87,25 @@ def run_one(mode: str, template: str, seed: int, total_steps: int,
         error = f"{type(e).__name__}: {e}"
         print(f"!!! TRAINING ERROR ({tag}): {error}")
         traceback.print_exc()
-        # Persist what we have so the crash is debuggable later
         try:
             (per_run_dir / "CRASH.txt").write_text(traceback.format_exc(), encoding="utf-8")
         except Exception:
             pass
     train_time = time.time() - t_start
 
-    # Dump the full in-memory train_log as a single JSON (complement to JSONL stream)
     try:
         (per_run_dir / f"{tag}_training_log.json").write_text(
             json.dumps(train_log, indent=2), encoding="utf-8")
     except Exception as e:
         print(f"  (train_log JSON save failed: {e})")
 
-    # Eval even on error (may still have partial policy)
+    # Eval 即使训练失败也跑 (可能还有 partial policy)
     try:
         print(f">>> EVAL   {tag}  deterministic")
         eval_metrics = trainer.evaluate(
             n_episodes=10, deterministic=True,
             trajectory_csv_path=str(per_run_dir / f"{tag}_eval_trajectory.csv"),
         )
-        # Also run stochastic eval (5 episodes) so we can see action spread
         stoch_metrics = trainer.evaluate(
             n_episodes=5, deterministic=False,
             trajectory_csv_path=str(per_run_dir / f"{tag}_eval_stochastic_trajectory.csv"),
@@ -139,22 +116,18 @@ def run_one(mode: str, template: str, seed: int, total_steps: int,
         traceback.print_exc()
         status = "eval_error" if status == "ok" else status
 
-    # Seed-level stability check:
-    # mark as "diverged" if any per-slice violation rate == 1.0
-    # (policy stuck in a maximally-bad regime) OR returns all -inf
+    # 任何 per-slice viol rate == 1.0 视为发散
     stable = (status == "ok" and
               "per_slice_viol_rate" in eval_metrics and
               all(v < 0.98 for v in eval_metrics["per_slice_viol_rate"]) and
               np.isfinite(eval_metrics.get("mean_return", np.nan)))
 
-    # Save final checkpoint (periodic ones already in per_run_dir)
     ckpt_path = per_run_dir / f"{tag}_final.pt"
     try:
         trainer.save(str(ckpt_path))
     except Exception as e:
         print(f"  (final checkpoint save failed: {e})")
 
-    # Per-run summary so each run_dir is self-describing
     run_summary = {
         "mode": mode, "template": template, "seed": seed,
         "status": status, "stable": bool(stable), "error": error,
@@ -192,9 +165,7 @@ def run_one(mode: str, template: str, seed: int, total_steps: int,
     }
 
 
-# ============================================================
-# Decision logic
-# ============================================================
+# ---------- 决策逻辑 ----------
 
 def decide(atc_results: list, vanilla_results: list) -> dict:
     """Apply PROMOTE / FALLBACK / AMBIGUOUS criteria."""
@@ -244,15 +215,11 @@ def decide(atc_results: list, vanilla_results: list) -> dict:
         ratio = None
     summary["most_constrained_viol_ratio_vanilla_over_atc"] = ratio
 
-    # U criterion is ONE-SIDED: we only penalize ATC for FALLING BEHIND Vanilla
-    # by more than the tolerance. If ATC beats Vanilla on U (agg_u_shortfall < 0),
-    # that's pure upside — no penalty. This matches the paper's narrative:
-    # "ATC should not sacrifice utilization to reduce violations." Beating both
-    # means ATC is strictly dominant.
+    # U 是 one-sided: 只罚 ATC 比 Vanilla 落后, ATC 反超不罚
     if atc_agg_u and van_agg_u:
         atc_u = float(np.mean(atc_agg_u))
         van_u = float(np.mean(van_agg_u))
-        agg_u_shortfall = (van_u - atc_u) / max(van_u, 1e-6)   # +ve = ATC loses; -ve = ATC wins
+        agg_u_shortfall = (van_u - atc_u) / max(van_u, 1e-6)   # >0 ATC 输, <0 ATC 赢
     else:
         atc_u = van_u = None
         agg_u_shortfall = None
@@ -293,9 +260,7 @@ def decide(atc_results: list, vanilla_results: list) -> dict:
     return summary
 
 
-# ============================================================
-# Markdown report
-# ============================================================
+# ---------- Markdown report ----------
 
 def _fmt(v, spec=".3f"):
     """Format-safely: missing / non-numeric -> '-'."""
@@ -360,7 +325,7 @@ def write_report(out_dir: Path, all_results: dict):
                   f"| {psf} | {_fmt(r.get('train_time_sec'), '.1f')} |")
     md.append("")
 
-    # Extras (Oracle / SafeSlice / Static / etc.)
+    # 其他 modes (oracle / safeslice / static_slicing 等) — 仅参考, 不进决策
     for extra_mode, runs in (all_results.get("extra_results") or {}).items():
         md.append(f"## Per-seed {extra_mode} (reference only, not used in decision)")
         md.append("")
@@ -376,7 +341,6 @@ def write_report(out_dir: Path, all_results: dict):
                       f"| {psf} | {_fmt(r.get('train_time_sec'), '.1f')} |")
         md.append("")
 
-    # Hyperparameter block so we can tell runs apart post-hoc
     if all_results.get("hyperparams"):
         md.append("## Hyperparameters")
         md.append("")
@@ -396,7 +360,7 @@ def write_report(out_dir: Path, all_results: dict):
 
 
 def write_manifest(out_dir: Path, all_results: dict):
-    """Top-level map of what's in this experiment directory. Read this first."""
+    """Top-level map of experiment dir contents."""
     md = []
     md.append(f"# Experiment Manifest — {all_results.get('timestamp', '?')}")
     md.append("")
@@ -463,9 +427,7 @@ def write_manifest(out_dir: Path, all_results: dict):
     (out_dir / "MANIFEST.md").write_text("\n".join(md), encoding="utf-8")
 
 
-# ============================================================
-# Main
-# ============================================================
+# ---------- Main ----------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -481,8 +443,8 @@ def main():
     parser.add_argument("--output", default=None, help="output dir (default: experiments/k3_<ts>)")
     parser.add_argument("--sanity-only", action="store_true",
                         help="run Template C first; abort if ATC not stable on >=2/3 seeds")
-    parser.add_argument("--no-lagrangian", action="store_true", help="ablation: disable Fix 3b")
-    parser.add_argument("--no-reward-norm", action="store_true", help="ablation: disable Fix 3a")
+    parser.add_argument("--no-lagrangian", action="store_true", help="ablation: disable per-slice Lagrangian")
+    parser.add_argument("--no-reward-norm", action="store_true", help="ablation: disable per-slice reward normalization")
     parser.add_argument("--lr-dual", type=float, default=1e-3,
                         help="per-slice Lagrangian learning rate (default 1e-3). Higher -> stronger pressure on violating slice.")
     parser.add_argument("--alpha-floor", type=float, default=1.0,
@@ -567,17 +529,14 @@ def main():
                                        sla_budget_override=sla_budget_override))
     if "vanilla_ppo" in args.modes:
         for seed in range(args.seeds):
+            # Vanilla = Dirichlet policy only, 不带 Lagrangian + reward-norm
             vanilla_results.append(run_one("vanilla_ppo", args.template, seed, args.steps,
                                            args.use_kalman, out_dir,
-                                           # vanilla should NOT use lagrangian/reward-norm,
-                                           # so the comparison is clean (ATC = all-three-fixes;
-                                           # vanilla = no fixes + Dirichlet only)
                                            use_lagrangian=False,
                                            normalize_per_slice_rewards=False,
                                            alpha_floor=args.alpha_floor,
                                            sla_budget_override=sla_budget_override))
-    # Extras (oracle / safeslice / static_slicing etc.) are NOT part of the binary
-    # ATC-vs-Vanilla decision, but we still train+save them as reference baselines.
+    # Extras (oracle / safeslice / static_slicing) 仅作 reference, 不进决策
     extra_results_by_mode = {}
     for extra_mode in args.modes:
         if extra_mode in ("proposed", "vanilla_ppo"):

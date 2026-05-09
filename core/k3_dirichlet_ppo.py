@@ -1,12 +1,13 @@
 # core/k3_dirichlet_ppo.py
 # ============================================================
-# K=3 Dirichlet-Policy PPO with Per-Slice Lagrangian
-# ============================================================
-# Applies TOP-3 fixes from Belief_K3_algorithm_recommendations_20260424.md:
-#   Fix 1: Dirichlet policy head (replaces softmax / Gaussian-Box)
-#   Fix 3a: Per-slice reward normalization (RunningMeanStd per slice)
-#   Fix 3b: Per-slice Lagrangian (K dual variables, one per SLA)
-# Warm-start (Fix 2) is optional; see `load_warmstart_checkpoint`.
+# K=3 Dirichlet-policy PPO + per-slice Lagrangian.
+#
+# 关键替换:
+#   - Dirichlet alpha-head (替 SB3 default Gaussian-Box, 解决 simplex commit)
+#   - Per-slice reward normalization (K 个 RunningMeanStd, 异质 SLA 不互相 wash)
+#   - Per-slice Lagrangian (K 个 dual var lambda_k, 一个 SLA 一个)
+#
+# 可选 K-ramp warm-start: 见 grow_dirichlet_head.
 # ============================================================
 
 import csv
@@ -26,12 +27,10 @@ from torch.distributions import Dirichlet
 from torch.optim import Adam
 
 
-# ============================================================
-# Running statistics for observation / reward normalization
-# ============================================================
+# ---------- Running mean/var (obs / reward 标准化) ----------
 
 class RunningMeanStd:
-    """Online running mean/var (Welford-like). Serializable for checkpoints."""
+    """Welford 在线均值/方差; ckpt 可序列化."""
     def __init__(self, shape=(), epsilon=1e-4):
         self.mean = np.zeros(shape, dtype=np.float64)
         self.var = np.ones(shape, dtype=np.float64)
@@ -65,18 +64,11 @@ class RunningMeanStd:
         self.count = d["count"]
 
 
-# ============================================================
-# Dirichlet Actor + Value Critic
-# ============================================================
+# ---------- Dirichlet actor + value critic ----------
 
 class DirichletActor(nn.Module):
-    """
-    Actor network: MLP encoder -> Dirichlet alpha head.
-    Uses softplus + alpha_floor to keep alpha >= alpha_floor (default 1.0),
-    which starts from a *uniform* Dirichlet distribution (safe exploration).
-    This replaces the SB3 default DiagGaussian over Box[0,1]^K which causes
-    the softmax-commit pathology on the K-simplex.
-    """
+    """Dirichlet alpha-head policy. softplus + alpha_floor 起步 ~uniform Dirichlet,
+    避开 SB3 default DiagGaussian-over-Box[0,1]^K 在 simplex 上的 softmax-commit."""
     def __init__(self, obs_dim: int, K: int, hidden_dims=(256, 256),
                  alpha_floor: float = 1.0):
         super().__init__()
@@ -87,7 +79,7 @@ class DirichletActor(nn.Module):
             prev = h
         self.encoder = nn.Sequential(*layers)
         self.alpha_head = nn.Linear(prev, K)
-        # Orthogonal init with small gain on the output head prevents early saturation.
+        # 输出头小 gain 正交初始化, 避免早期饱和
         nn.init.orthogonal_(self.alpha_head.weight, gain=0.01)
         nn.init.zeros_(self.alpha_head.bias)
         self.alpha_floor = alpha_floor
@@ -100,14 +92,11 @@ class DirichletActor(nn.Module):
         return alpha
 
     def distribution(self, obs: torch.Tensor) -> Dirichlet:
-        # validate_args=False: avoids torch's strict Simplex check rejecting
-        # FP32-rounded samples whose sum differs from 1.0 by ~1e-7.
-        # We clamp+renormalize actions ourselves before log_prob.
+        # validate_args=False: 自己 clamp+renorm, 跳 torch strict simplex check (FP32 sum ~1e-7 漂)
         return Dirichlet(self.forward(obs), validate_args=False)
 
     @staticmethod
     def _to_simplex(x: torch.Tensor) -> torch.Tensor:
-        """Clean a near-simplex tensor: positive + exact sum=1 (FP-safe)."""
         x = x.clamp(min=1e-6)
         return x / x.sum(dim=-1, keepdim=True)
 
@@ -115,7 +104,7 @@ class DirichletActor(nn.Module):
         dist = self.distribution(obs)
         if deterministic:
             alpha = dist.concentration
-            # Mode of Dirichlet: (alpha-1)/(sum-K) when all alpha>1; else fallback to mean
+            # Dirichlet mode: (alpha-1)/(sum(alpha)-K) when alpha>1, 否则 fallback 到 mean
             if (alpha > 1).all():
                 mode = (alpha - 1) / (alpha.sum(dim=-1, keepdim=True) - alpha.shape[-1])
             else:
@@ -129,7 +118,7 @@ class DirichletActor(nn.Module):
 
     def log_prob_entropy(self, obs, actions):
         dist = self.distribution(obs)
-        # Clamp actions to open simplex to avoid log(0) in Dirichlet.log_prob
+        # clamp 到 open simplex 避免 log(0)
         actions = self._to_simplex(actions)
         return dist.log_prob(actions), dist.entropy()
 
@@ -151,26 +140,21 @@ class ValueCritic(nn.Module):
         return self.head(self.encoder(obs)).squeeze(-1)
 
 
-# ============================================================
-# Per-slice Lagrangian  (Fix 3)
-# ============================================================
+# ---------- Lagrangian (per-slice / global) ----------
 
 class PerSliceLagrangian:
-    """
-    K independent dual variables lambda_k, one per slice's SLA budget.
-    Update:  lambda_k <- max(0, lambda_k + lr * (E[viol_k] - budget_k))
-    Per-slice reward normalization is tracked separately (see RunningMeanStd).
-    """
+    """K 个独立 dual var lambda_k, 一个 SLA budget 一个."""
     def __init__(self, K: int, sla_budget: np.ndarray, lr_dual: float = 1e-3,
                  lam_init: float = 0.0, lam_max: float = 50.0):
         self.K = K
-        self.sla_budget = np.asarray(sla_budget, dtype=np.float64)  # per-slice violation rate caps
+        self.sla_budget = np.asarray(sla_budget, dtype=np.float64)
         self.lr_dual = lr_dual
         self.lam = np.full(K, lam_init, dtype=np.float64)
         self.lam_max = lam_max
         self.history = []
 
     def update(self, per_slice_violation_rate: np.ndarray):
+        # lambda_k <- max(0, lambda_k + lr * (E[viol_k] - budget_k))
         excess = per_slice_violation_rate - self.sla_budget
         self.lam = np.clip(self.lam + self.lr_dual * excess, 0.0, self.lam_max)
         self.history.append({"lam": self.lam.tolist(),
@@ -191,15 +175,8 @@ class PerSliceLagrangian:
 
 
 class GlobalSafeSliceLagrangian:
-    """SafeSlice-style single global Lagrangian (CPO descendant per [SafeSlice_2025]).
-
-    Unlike PerSliceLagrangian (K independent duals), maintains a single scalar lambda
-    that ascends on aggregate (mean across slices) violation rate. This is a faithful
-    reproduction of the [SafeSlice_2025] grid-searched Lagrangian formulation: the
-    constraint signal is observation-conditioned (mean over per-slice violations), so
-    under stale telemetry the dual update lacks the per-slice resolution of ATC's mu_k
-    ascent and the policy collapses into the conservatism trap predicted in section II.B.
-    """
+    """SafeSlice 风格单个全局 lambda (CPO 系). 对 K 个 slice 的平均 violation 做 dual ascent;
+    stale telemetry 下信号 degenerate, 没有 per-slice 区分度, 表现塌成 Vanilla-PPO."""
     def __init__(self, sla_budget_global: float = 0.05, lr_dual: float = 1e-3,
                  lam_init: float = 0.0, lam_max: float = 100.0):
         self.sla_budget_global = float(sla_budget_global)
@@ -226,9 +203,7 @@ class GlobalSafeSliceLagrangian:
         self.lam_max = float(d["lam_max"])
 
 
-# ============================================================
-# Rollout buffer
-# ============================================================
+# ---------- Rollout buffer ----------
 
 @dataclass
 class Rollout:
@@ -261,9 +236,7 @@ class Rollout:
         }
 
 
-# ============================================================
-# PPO Trainer with Dirichlet + per-slice Lagrangian
-# ============================================================
+# ---------- PPO trainer ----------
 
 class K3DirichletPPO:
     def __init__(
@@ -294,9 +267,9 @@ class K3DirichletPPO:
         safeslice_mode: bool = False,
         seed: int = 0,
         verbose: bool = True,
-        log_dir: Optional[str] = None,            # if set, stream per-update logs to disk
-        checkpoint_every_updates: int = 10,        # 0 to disable periodic ckpt
-        tag: str = "",                             # prefix for log files ("<mode>_seed<seed>")
+        log_dir: Optional[str] = None,            # 设了就 stream per-update log 到磁盘
+        checkpoint_every_updates: int = 10,        # 0 disable
+        tag: str = "",                             # log file 前缀 ("<mode>_seed<seed>")
     ):
         self.cfg = locals().copy()
         self.cfg.pop("self"); self.cfg.pop("env_fn")
@@ -305,7 +278,7 @@ class K3DirichletPPO:
         self.tag = tag or f"seed{seed}"
         torch.manual_seed(seed); np.random.seed(seed)
 
-        # Streaming log setup
+        # streaming log
         self.log_dir = Path(log_dir) if log_dir else None
         if self.log_dir is not None:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -343,8 +316,7 @@ class K3DirichletPPO:
         self.obs_rms = RunningMeanStd(shape=(self.obs_dim,)) if normalize_obs else None
         self.per_slice_r_rms = [RunningMeanStd() for _ in range(K)] if normalize_per_slice_rewards else None
         if safeslice_mode:
-            # SafeSlice: single global Lagrangian on aggregate violation (CPO descendant).
-            # Mutually exclusive with per-slice Lagrangian (which is ATC's distinguishing mechanism).
+            # SafeSlice 模式: global lambda (与 per-slice Lagrangian 互斥)
             sla_budget_global = float(np.mean(np.asarray(sla_budget, dtype=np.float64)))
             self.lagrangian = None
             self.use_lagrangian = False
@@ -367,11 +339,9 @@ class K3DirichletPPO:
 
     def _shape_reward(self, raw_reward: float, per_slice_reward: np.ndarray,
                       per_slice_violation: np.ndarray) -> float:
-        """Apply reward normalization and per-slice Lagrangian penalty."""
         if self.per_slice_r_rms is not None:
             normed = np.zeros(self.K)
             for k in range(self.K):
-                # Update running stats with current batch point (single-step online)
                 self.per_slice_r_rms[k].update(np.asarray([per_slice_reward[k]]))
                 rk = per_slice_reward[k]
                 sigma_k = math.sqrt(self.per_slice_r_rms[k].var) + 1e-8
@@ -382,7 +352,6 @@ class K3DirichletPPO:
         if self.lagrangian is not None:
             base = base - float((self.lagrangian.lam * per_slice_violation).sum())
         elif self.safeslice_lagrangian is not None:
-            # SafeSlice: subtract single global lambda * mean(per-slice violation)
             base = base - float(self.safeslice_lagrangian.lam * np.mean(per_slice_violation))
         return float(base)
 
@@ -392,7 +361,6 @@ class K3DirichletPPO:
         episode_counter = 0
 
         for t in range(self.rollout_steps):
-            # Update obs stats online, normalize
             if self.obs_rms is not None:
                 self.obs_rms.update(obs.reshape(1, -1))
             obs_n = self._normalize_obs(obs)
@@ -429,12 +397,12 @@ class K3DirichletPPO:
 
             self.global_step += 1
 
-        # Bootstrap last value
+        # bootstrap last value
         obs_n = self._normalize_obs(obs)
         with torch.no_grad():
             last_v = float(self.critic(torch.as_tensor(obs_n, dtype=torch.float32,
                                        device=self.device).unsqueeze(0)).item())
-        roll.values.append(last_v)   # trailing bootstrap value
+        roll.values.append(last_v)
         return roll
 
     # ---------- GAE ----------
@@ -453,7 +421,7 @@ class K3DirichletPPO:
 
     # ---------- PPO update ----------
     def _entropy_coef(self):
-        # Linear anneal from ent_coef0 -> ent_coef_final across total_steps
+        # entropy coef linear anneal
         frac = min(1.0, self.global_step / max(1, self.total_steps))
         return self.ent_coef0 * (1 - frac) + self.ent_coef_final * frac
 
@@ -505,7 +473,7 @@ class K3DirichletPPO:
                 losses["entropy"].append(ent.item())
                 losses["kl"].append(kl)
 
-        # Dual ascent on lambda_k using rollout-averaged violation rate
+        # dual ascent on rollout-mean viol
         if self.lagrangian is not None:
             mean_viol = arr["per_slice_violations"].mean(axis=0)
             self.lagrangian.update(mean_viol)
@@ -536,10 +504,10 @@ class K3DirichletPPO:
             ),
         }
         self.train_log.append(log)
-        # Stream to disk so we don't lose anything if the run crashes.
+        # stream to disk (run crash safe)
         if self._train_jsonl is not None:
             self._train_jsonl.write(json.dumps(log) + "\n")
-        # Periodic checkpoint so mid-run data is preserved.
+        # periodic ckpt
         if (self.log_dir is not None and self.checkpoint_every_updates > 0
                 and self.update_idx % self.checkpoint_every_updates == 0):
             ckpt = self.log_dir / f"{self.tag}_ckpt_upd{self.update_idx:04d}.pt"
@@ -562,7 +530,6 @@ class K3DirichletPPO:
                       f"viol={[f'{v:.3f}' for v in log['per_slice_viol_rate']]} "
                       f"lam={[f'{v:.2f}' for v in log['lambda']]} "
                       f"KL={log['kl']:+.4f} Ent={log['entropy']:.3f} ({elapsed:.0f}s)")
-        # Close streaming log cleanly
         if self._train_jsonl is not None:
             self._train_jsonl.flush()
             self._train_jsonl.close()
@@ -573,10 +540,7 @@ class K3DirichletPPO:
     @torch.no_grad()
     def evaluate(self, n_episodes: int = 10, deterministic: bool = True,
                  trajectory_csv_path: Optional[str] = None):
-        """
-        Evaluate the current policy. If trajectory_csv_path is set, dump
-        one row per env step (for plotting + post-hoc analysis).
-        """
+        """eval 当前 policy; trajectory_csv_path 设了就 dump 每步 row."""
         metrics = {
             "per_slice_viol_rate": np.zeros(self.K),
             "per_slice_mean_util": np.zeros(self.K),
@@ -647,7 +611,7 @@ class K3DirichletPPO:
 
         return metrics
 
-    # ---------- checkpointing ----------
+    # ---------- ckpt ----------
     def save(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         ckpt = {
@@ -683,29 +647,20 @@ class K3DirichletPPO:
         self.update_idx = ckpt.get("update_idx", 0)
 
 
-# ============================================================
-# Optional Fix 2 helper: grow policy head from K_old to K_new
-# ============================================================
+# ---------- K-ramp warm-start helper ----------
 
 def grow_dirichlet_head(old_actor: DirichletActor, new_K: int,
                         new_alpha_floor: float = None) -> DirichletActor:
-    """
-    For Fix 2 (curriculum K-ramp). Take an actor trained on K_old slices
-    and return a new actor with K_new slices; encoder weights are copied,
-    old K_old slice columns in the head are copied, new slice columns
-    are initialized near zero (gives ~alpha_floor uniform start on new dim).
-    """
+    """K-ramp: 把 K_old actor 扩到 K_new (encoder copy, 老 slice 列 copy, 新列 ~0 起)."""
     old_K = old_actor.K
     assert new_K >= old_K, "grow only (new_K >= old_K)"
     hidden = tuple(l.out_features for l in old_actor.encoder if isinstance(l, nn.Linear))
     obs_dim = [l for l in old_actor.encoder if isinstance(l, nn.Linear)][0].in_features
     floor = new_alpha_floor if new_alpha_floor is not None else old_actor.alpha_floor
     new_actor = DirichletActor(obs_dim, new_K, hidden, alpha_floor=floor)
-    # copy encoder
     new_actor.encoder.load_state_dict(old_actor.encoder.state_dict())
-    # copy old K_old output rows; new rows start near zero
     with torch.no_grad():
+        # 老 slice 列 copy; 新列 keep ortho 0.01 init
         new_actor.alpha_head.weight[:old_K, :] = old_actor.alpha_head.weight.clone()
         new_actor.alpha_head.bias[:old_K] = old_actor.alpha_head.bias.clone()
-        # leave new rows at their orthogonal_(0.01) init
     return new_actor

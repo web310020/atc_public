@@ -1,37 +1,39 @@
-# core_logic.py
+# core/core_logic.py
+# ============================================================
+# Belief engine + adaptive telemetry + safety fusion 模块.
+#
+# 主要组件:
+#   - Belief_Manager_KF: Kalman 连续 belief (主用, 配 ATC)
+#   - Belief_Manager:    discrete 3-state POMDP belief (备用, K=1)
+#   - Adaptive_Telemetry_Controller: entropy-driven E2 sampling 周期
+#   - Security_Control_Unit: trust-aware fusion (AI action vs guardrail)
+#   - LSTMPredictor / LSTMController: pure-LSTM 预测 baseline
+# ============================================================
+
 import numpy as np
 from scipy.stats import norm
 import torch
 import torch.nn as nn
 
 
-# ============================================================
-# Belief 引擎: Kalman filter (主版本, ATC 用这个)
-# ============================================================
+# ---------- Kalman 连续 belief ----------
 
 class Belief_Manager_KF:
-    """
-    连续 state 的 Kalman filter belief 引擎.
-    用 continuous Gaussian tracking 代替 discrete 3-state POMDP,
-    对应 Gaussian-errors 假设下的 belief 估计.
-    """
+    """连续 Gaussian utilization tracker (替 discrete 3-state POMDP)."""
 
     def __init__(self, process_noise=0.005, obs_noise_std=0.05):
-        self.mu = 0.5          # state estimate (utilization)
-        self.P = 0.1           # error covariance
-        self.Q = process_noise # process noise variance
-        self.R = obs_noise_std ** 2  # observation noise variance
-        self.A = 0.95          # state transition coefficient (matches physics)
+        self.mu = 0.5
+        self.P = 0.1
+        self.Q = process_noise
+        self.R = obs_noise_std ** 2
+        self.A = 0.95
         self.obs_noise_std = obs_noise_std
 
-        # Variance normalization: P_max is the maximum practical variance
-        # during telemetry gaps (20 steps × Q=0.005 + initial ≈ 0.15)
+        # P_max ≈ 20-step gap × Q + initial; H_max 兼容 discrete 3-state 阈值
         self.P_max = 0.15
-        # H_max compatible with old 3-state thresholds for gamma/telemetry logic
         self.H_max = 1.58
 
     def predict(self, action, K=1):
-        """Kalman predict step: propagate state estimate through dynamics."""
         if K == 1:
             action_effect = (0.5 - action) * 0.1
             drift = 0.02
@@ -44,50 +46,41 @@ class Belief_Manager_KF:
         return self.mu
 
     def update(self, observation):
-        """Kalman update step: fuse observation into estimate."""
-        K = self.P / (self.P + self.R)  # Kalman gain
+        K = self.P / (self.P + self.R)
         self.mu = np.clip(self.mu + K * (observation - self.mu), 0, 1.0)
         self.P = (1 - K) * self.P
         return self.mu
 
     def get_entropy(self):
-        """Variance-normalized uncertainty, mapped to [0, H_max] for threshold compatibility."""
-        # Maps P ∈ [0, P_max] → [0, H_max], compatible with all gamma/telemetry thresholds
+        # P ∈ [0, P_max] → [0, H_max], 对齐原 discrete 阈值
         normalized = min(self.P / self.P_max, 1.0) * self.H_max
         return normalized
 
     def get_mean(self):
-        """Return current state estimate."""
         return self.mu
 
     def get_variance(self):
-        """Return current estimation uncertainty."""
         return self.P
 
     def get_high_load_probability(self, threshold=0.5):
-        """P(true_util > threshold) under current Gaussian belief."""
         if self.P <= 0:
             return 1.0 if self.mu > threshold else 0.0
         return 1.0 - norm.cdf(threshold, loc=self.mu, scale=np.sqrt(max(self.P, 1e-12)))
 
     def reset(self):
-        """Reset to prior."""
         self.mu = 0.5
         self.P = 0.1
 
 
-# ============================================================
-# Belief 引擎: discrete 3-state (备用版本)
-# ============================================================
+# ---------- discrete 3-state belief (legacy, K=1 时用) ----------
 
 class Belief_Manager:
-    """Legacy discrete 3-state POMDP belief manager."""
+    """备用 discrete 3-state POMDP belief, K=1 时用."""
 
     def __init__(self, num_states=3):
         self.num_states = num_states
         self.belief = np.full(num_states, 1.0 / num_states)
 
-        # Auto-generate tridiagonal transition matrix
         if num_states == 3:
             self.base_transition = np.array([
                 [0.85, 0.15, 0.00],
@@ -97,7 +90,6 @@ class Belief_Manager:
         else:
             self.base_transition = self._generate_transition_matrix(num_states)
 
-        # State centroids and observation models
         self.state_centroids = np.linspace(0.15, 0.85, num_states)
         self.observation_models = {
             s: {'mu': self.state_centroids[s], 'sigma': 0.05}
@@ -106,7 +98,6 @@ class Belief_Manager:
         self.H_max = np.log2(num_states)
 
     def _generate_transition_matrix(self, n):
-        """Generate tridiagonal stochastic matrix for n states."""
         P = np.zeros((n, n))
         for i in range(n):
             P[i, i] = 0.80
@@ -114,7 +105,6 @@ class Belief_Manager:
                 P[i, i - 1] = 0.10
             if i < n - 1:
                 P[i, i + 1] = 0.10
-            # Ensure row sums to 1
             P[i] /= P[i].sum()
         return P
 
@@ -136,7 +126,6 @@ class Belief_Manager:
                 new_belief[1] = prior[1] * (1 - s) + prior[2] * s
                 new_belief[2] = prior[2] * (1 - s)
         else:
-            # General case: shift probability mass along state axis
             s = min(abs(shift), 0.9)
             direction = 1 if shift > 0 else -1
             for i in range(self.num_states):
@@ -167,26 +156,20 @@ class Belief_Manager:
         return np.dot(self.belief, self.state_centroids)
 
     def get_high_load_probability(self, threshold=None):
-        """Return probability of being in the highest state."""
         return self.belief[-1]
 
     def reset(self):
         self.belief = np.full(self.num_states, 1.0 / self.num_states)
 
 
-# ============================================================
-# Adaptive Telemetry Controller
-# ============================================================
+# ---------- Adaptive telemetry controller ----------
 
 class Adaptive_Telemetry_Controller:
     def __init__(self):
         self.period = 200
 
     def adapt(self, belief_engine, tau=0.9):
-        """
-        Adapt telemetry period based on belief engine uncertainty.
-        Works with both KF and discrete belief engines.
-        """
+        # entropy 高 / 高负载概率高 → 缩短 sampling 周期
         entropy = belief_engine.get_entropy()
         high_risk = belief_engine.get_high_load_probability()
         if entropy > tau or high_risk > 0.5:
@@ -196,31 +179,28 @@ class Adaptive_Telemetry_Controller:
         return self.period
 
 
-# ============================================================
-# Security Control Unit (works with both KF and discrete)
-# ============================================================
+# ---------- Security control unit (trust-aware fusion) ----------
 
 class Security_Control_Unit:
     def __init__(self, base_lam=0.3):
         self.base_lam = base_lam
 
     def get_guardrail_action(self, belief_engine):
-        """Generate conservative guardrail action based on belief."""
+        # 基于 belief mean 的保守 fallback action
         mu = belief_engine.get_mean()
         if mu > 0.65:
-            return 0.95  # Strong throttle for high load
+            return 0.95
         elif mu < 0.25:
-            return 0.05  # Release resources for low load
+            return 0.05
         return 0.5
 
     def verify_and_fuse(self, ai_action, belief_engine):
-        """Fuse AI action with guardrail based on risk assessment."""
+        # AI action 与 guardrail 的 risk-weighted 融合
         mu = belief_engine.get_mean()
         entropy = belief_engine.get_entropy()
         H_max = belief_engine.H_max
         high_risk = belief_engine.get_high_load_probability()
 
-        # Physical fuse: if predicted utilization exceeds safety boundary
         if mu > 0.60:
             risk_factor = 0.99
         else:
@@ -231,9 +211,7 @@ class Security_Control_Unit:
         return final_action, risk_factor
 
 
-# ============================================================
-# LSTM Baseline (unchanged)
-# ============================================================
+# ---------- LSTM baseline ----------
 
 class LSTMPredictor(nn.Module):
     def __init__(self, input_size=1, hidden_size=16, num_layers=1):

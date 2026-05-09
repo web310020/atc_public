@@ -8,7 +8,7 @@ Replaces the 1x4 figure* horizontal subfig layout in current Fig 4
 Data: same K=1 main-run rollouts used by auto_plot_v2.py.
 We re-use auto_plot_v2's data collection but plot in 2-panel single-col.
 
-Usage: cd papers_src/belief_v3 && python -m fig.plot_perf_distributions
+Usage: python -m fig.plot_perf_distributions
 Output: paper_draft/figures/fig_perf_distributions.pdf + .png
 """
 import os, glob, json

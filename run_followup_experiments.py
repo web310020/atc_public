@@ -5,10 +5,6 @@
   - Vanilla-PPO baseline 验证 (检查 reference U 能否复现).
   - K=5 用 per-slice tau_k (URLLC 收紧到 tau=0.3).
 
-预估耗时:
-  串行:     ~10-15 min
-  2 worker: ~6-10 min
-
 Usage:
     python run_followup_experiments.py --workers 2
 

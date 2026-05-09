@@ -1,41 +1,21 @@
 """
-ATC 各组件 ablation 子类.
+ATC ablation subclasses (隔离单组件贡献).
 
-四种变体, 每个 ablation 只关掉/换掉一个组件:
-- ATC_NoAdaptiveTelemetry: 固定 signaling 周期 (没有 entropy gating)
-- ATC_NoSCU:               跳过 safety calibration unit (raw action 直接走到 reflex)
-- ATC_BangBang:            binary guardrail (代替 proportional reflex)
-- (use_kalman=True):       连续 belief 版本 (base simulator 自带的 flag)
-
-每个子类只重写 step() 的关键路径, 其他逻辑跟 proposed ATC 完全一致,
-这样可以单独看每个组件的贡献.
-
-Usage:
-    env = ATC_NoAdaptiveTelemetry(mode="proposed", K=1, ...)
-    env = ATC_NoSCU(mode="proposed", K=1, ...)
-    env = ATC_BangBang(mode="proposed", K=1, ...)
-    env = E2_Node_Simulator(mode="proposed", K=1, use_kalman=True)
+每个子类只 flip ONE component, 其它保持 "proposed" mode 不变:
+  - ATC_NoAdaptiveTelemetry: 固定 base_period, 关 entropy-gated 自适应
+  - ATC_NoSCU:               跳过 RIC-side safety unit (raw action 直送融合)
+  - ATC_BangBang:            BS-side reflex 改 binary 阈值 (无 proportional 区)
+  - Kalman belief 变体: E2_Node_Simulator(use_kalman=True)
 """
 
 import numpy as np
 from core.telemetry_env import E2_Node_Simulator
 
 
-# ============================================================
-# Ablation 1: w/o entropy-driven adaptive telemetry
-# ============================================================
+# ---------- 关 entropy-driven 自适应 telemetry ----------
 class ATC_NoAdaptiveTelemetry(E2_Node_Simulator):
-    """ATC 但 telemetry 周期固定 (没有 entropy-gated adaptation).
-
-    把 adaptive_telemetry_controller.adapt() 关掉, telemetry 周期始终
-    保持在 base_period (belief entropy 飙升时也不触发高频采样).
-    用来看 entropy-driven gating 对 signaling efficiency 的实际贡献.
-
-    预期: signaling cost 要么 INCREASE (没有 adaptive throttle)
-    要么 DECREASE (没有 adaptive boost), 方向告诉我们 gating 的作用.
-    """
+    """固定 telemetry period (无 entropy-gated 自适应)."""
     def step(self, xapp_action):
-        # Force fixed period (skip adaptive logic)
         if np.isscalar(xapp_action) or len(xapp_action) == 1:
             raw_action = np.full(self.K, float(xapp_action[0]) if not np.isscalar(xapp_action) else float(xapp_action))
         else:
@@ -43,11 +23,11 @@ class ATC_NoAdaptiveTelemetry(E2_Node_Simulator):
 
         entropies = np.array([be.get_entropy() for be in self.belief_engines])
 
-        # Skip adaptive telemetry — keep period constant
+        # 强制固定 period
         for tc in self.telemetry_controllers:
             tc.period = self.base_period
 
-        # Rest of "proposed" logic preserved
+        # 其余沿用 "proposed" 逻辑
         ric_action = np.zeros(self.K)
         current_lam = np.zeros(self.K)
         for k in range(self.K):
@@ -71,33 +51,24 @@ class ATC_NoAdaptiveTelemetry(E2_Node_Simulator):
         return self._physics_and_observation(final_action, raw_action, current_lam, gamma, entropies)
 
 
-# ============================================================
-# Ablation 2: w/o L4 SCU circuit-breaker
-# ============================================================
+# ---------- 关 RIC-side safety unit ----------
 class ATC_NoSCU(E2_Node_Simulator):
-    """ATC 但跳过 L4 Safety Calibration Unit (security_unit.verify_and_fuse).
-
-    Raw xApp action 不经过 L4 的 belief-triggered circuit-breaker, 直接
-    送到 trust-aware fusion (L5/L6). 用来看 SCU 是不是必须的, 还是 L5+L6
-    单独就够 safety.
-
-    预期: violation rate 会 INCREASE (没有 L4 hard gate).
-    """
+    """跳过 security_unit.verify_and_fuse, raw action 直送融合."""
     def step(self, xapp_action):
         if np.isscalar(xapp_action) or len(xapp_action) == 1:
             raw_action = np.full(self.K, float(xapp_action[0]) if not np.isscalar(xapp_action) else float(xapp_action))
         else:
             raw_action = np.array(xapp_action[:self.K], dtype=np.float64)
 
-        # Adaptive telemetry runs normally
+        # 自适应 telemetry 正常跑
         for k in range(self.K):
             self.telemetry_controllers[k].adapt(self.belief_engines[k], tau=self.tau_per[k])
 
         entropies = np.array([be.get_entropy() for be in self.belief_engines])
 
-        # 关键: 跳过 L4 SCU, raw_action 直接当作 ric_action 用
+        # 跳过 SCU, raw action 直送
         ric_action = self._simplex_project(raw_action)
-        current_lam = np.zeros(self.K)  # No lambda since no SCU
+        current_lam = np.zeros(self.K)
 
         rho_k = np.array([
             min(1.0, entropies[k] / self.belief_engines[k].H_max +
@@ -114,44 +85,26 @@ class ATC_NoSCU(E2_Node_Simulator):
         return self._physics_and_observation(final_action, raw_action, current_lam, gamma, entropies)
 
 
-# ============================================================
-# Ablation 3: w/o L6 proportional reflex (use bang-bang)
-# ============================================================
+# ---------- BS-side reflex 改 binary (bang-bang) ----------
 class ATC_BangBang(E2_Node_Simulator):
-    """ATC 但 L6 guardrail 改成 binary bang-bang (而不是 proportional).
-
-    把 _get_local_safe_action() 里的 proportional safe action 换成
-    hard threshold: utilization > tau 就最大 throttle (0.95);
-    否则 full release (0.2). 中间没有渐变带.
-
-    预期: violation depth psi 会 INCREASE (突变 switching 容易 overshoot),
-    spectral efficiency 也可能退化.
-    """
+    """BS-side reflex: 二值阈值 (无 proportional gradient zone)."""
     def _get_local_safe_action(self):
-        """Bang-bang 版本: binary hard threshold, 没有渐变带."""
         a_guard = np.zeros(self.K)
         for k in range(self.K):
             if self.true_util[k] > self.tau_k[k]:
-                a_guard[k] = 0.95  # Hard throttle
+                a_guard[k] = 0.95
             else:
-                a_guard[k] = 0.2   # Full release
+                a_guard[k] = 0.2
         return a_guard
 
 
-# ============================================================
-# Helper used by 3 subclasses (extracts physics + obs from base env)
-# ============================================================
+# ---------- helper: physics + obs 注入 base env (避免子类重复) ----------
 def _add_physics_helper():
-    """如果 E2_Node_Simulator 没有 _physics_and_observation 就注入一个.
-
-    把 "final_action 算好之后" 的逻辑抽出来, 这样上面的 ablation 子类
-    可以直接复用, 不用重复写 physics/sampling/observation 代码.
-    """
     if hasattr(E2_Node_Simulator, '_physics_and_observation'):
         return
 
     def _physics_and_observation(self, final_action, raw_action, current_lam, gamma, entropies):
-        # B. Physics evolution
+        # physics 演进
         for k in range(self.K):
             traffic_flux = np.random.normal(0, self.sigma_k[k])
             if self.K == 1:
@@ -165,7 +118,7 @@ def _add_physics_helper():
                 0.95 * self.true_util[k] + action_effect + traffic_flux + drift, 0, 1.0
             )
 
-        # C. E2 sampling + belief update
+        # E2 sampling + belief update
         total_sig_cost = 0.0
         sampled_any = False
         for k in range(self.K):
@@ -179,7 +132,7 @@ def _add_physics_helper():
             else:
                 self.belief_engines[k].predict(final_action[k], K=self.K)
 
-        # D. Reward (matches base env Eq.7)
+        # reward
         r_sla = 0.0; r_perf = 0.0
         for k in range(self.K):
             u_k = self.true_util[k]; tau_k = self.tau_k[k]
@@ -190,7 +143,7 @@ def _add_physics_helper():
         r_cost = -2.0 * total_sig_cost if (sampled_any and self.mode != "oracle") else 0.0
         total_reward = r_perf + r_sla + r_cost
 
-        # E. Info dict
+        # info dict
         avg_util = np.mean(self.true_util)
         avg_belief = np.mean([be.get_mean() for be in self.belief_engines])
         avg_entropy = np.mean(entropies)
@@ -213,7 +166,7 @@ def _add_physics_helper():
         }
         self.history.append(info)
 
-        # F. Observation (proposed-mode shape)
+        # obs (proposed-mode shape)
         belief_means_now = np.array([be.get_mean() for be in self.belief_engines])
         entropies_now = np.array([be.get_entropy() for be in self.belief_engines])
         obs_vec = np.concatenate([
