@@ -1,19 +1,22 @@
 #!/usr/bin/env python
 # run_k3_experiment.py
 # ============================================================
-# K=3 多 slice 训练 + eval runner.
+# K=3 PROMOTE-or-FALLBACK decision experiment for the Belief paper.
+# Target decision date: 2026-04-26 evening.
 #
-# 流程:
-#   1. 训练 ATC ("proposed") mode: Dirichlet PPO + per-slice Lagrangian,
-#      K=3 配置.
-#   2. 训练 Vanilla-PPO baseline: 同样的 Dirichlet policy, 但去掉
-#      belief engine / trust fusion / adaptive telemetry. RL stack 一致,
-#      所以 ATC vs baseline 是受控对比.
-#   3. 在确定性 eval set 上评估两个 mode, 输出 per-slice violation rate,
-#      aggregate U, 以及一个决策块 (PROMOTE / FALLBACK / AMBIGUOUS),
-#      判定标准在下面定义.
+# What it does:
+#   1. Trains the ATC ("proposed") mode with Dirichlet PPO + per-slice
+#      Lagrangian on a K=3 slice configuration (Template C for sanity,
+#      Template A for the real decision run).
+#   2. Trains a Vanilla-PPO baseline with the same Dirichlet policy but no
+#      Belief Engine / Trust Fusion / adaptive telemetry (this isolates the
+#      ATC mechanism — the RL stack is identical so the comparison is fair).
+#   3. Evaluates both over a deterministic eval set and reports per-slice
+#      violation rates, aggregate U, and a DECISION block (PROMOTE / FALLBACK /
+#      AMBIGUOUS) against the criteria defined in
+#      `paper_draft/20260424_new/Belief_K3_experiment_design_20260424.md`.
 #
-# Output: JSON + markdown report 写到 experiments/<run_name>/
+# Output: JSON + markdown report in experiments/k3_<timestamp>/
 # ============================================================
 
 import argparse
@@ -64,7 +67,8 @@ def run_one(mode: str, template: str, seed: int, total_steps: int,
             normalize_per_slice_rewards: bool = True,
             lr_dual: float = 1e-3,
             alpha_floor: float = 1.0,
-            sla_budget_override: list = None) -> dict:
+            sla_budget_override: list = None,
+            safeslice_mode: bool = False) -> dict:
     env_fn = make_env(mode=mode, template=template, use_kalman=use_kalman)
     sla_budget = (sla_budget_override if sla_budget_override is not None
                   else TEMPLATES[template]["sla_budget"])
@@ -78,11 +82,12 @@ def run_one(mode: str, template: str, seed: int, total_steps: int,
           f"lr_dual={lr_dual} alpha_floor={alpha_floor} sla_budget={sla_budget}")
     trainer = K3DirichletPPO(
         env_fn=env_fn,
-        K=len(TEMPLATES[template]["names"]),  # K-agnostic: derived from template
+        K=len(TEMPLATES[template]["names"]),  # K from template (supports K=3 and K=5)
         sla_budget=sla_budget,
         total_steps=total_steps,
         seed=seed,
         use_lagrangian=use_lagrangian,
+        safeslice_mode=safeslice_mode,
         normalize_per_slice_rewards=normalize_per_slice_rewards,
         lr_dual=lr_dual,
         alpha_floor=alpha_floor,
@@ -239,11 +244,11 @@ def decide(atc_results: list, vanilla_results: list) -> dict:
         ratio = None
     summary["most_constrained_viol_ratio_vanilla_over_atc"] = ratio
 
-    # U criterion is one-sided: ATC is only penalized when it falls behind
-    # Vanilla on U by more than the tolerance. Beating Vanilla (negative
-    # agg_u_shortfall) is pure upside, since ATC should not sacrifice
-    # utilization to reduce violations. Beating Vanilla on both U and the
-    # violation criterion means ATC is strictly dominant.
+    # U criterion is ONE-SIDED: we only penalize ATC for FALLING BEHIND Vanilla
+    # by more than the tolerance. If ATC beats Vanilla on U (agg_u_shortfall < 0),
+    # that's pure upside — no penalty. This matches the paper's narrative:
+    # "ATC should not sacrifice utilization to reduce violations." Beating both
+    # means ATC is strictly dominant.
     if atc_agg_u and van_agg_u:
         atc_u = float(np.mean(atc_agg_u))
         van_u = float(np.mean(van_agg_u))
@@ -316,7 +321,7 @@ def write_report(out_dir: Path, all_results: dict):
     md.append("## Decision summary")
     md.append("")
     dec = all_results["decision"]
-    md.append(f"Decision: `{dec['decision']}`")
+    md.append(f"**→ Decision: `{dec['decision']}`**")
     md.append("")
     md.append(f"Reason: {dec['reason']}")
     md.append("")
@@ -335,7 +340,7 @@ def write_report(out_dir: Path, all_results: dict):
         ev = r.get("eval", {})
         ps = ev.get("per_slice_viol_rate", [])
         psf = "[" + ", ".join(f"{v:.3f}" for v in ps) + "]" if ps else "-"
-        md.append(f"| {r['seed']} | {'OK' if r['stable'] else 'unstable'} "
+        md.append(f"| {r['seed']} | {'✅' if r['stable'] else '❌'} "
                   f"| {_fmt(ev.get('most_constrained_slice_viol'))} "
                   f"| {_fmt(ev.get('aggregate_util'))} "
                   f"| {psf} | {_fmt(r.get('train_time_sec'), '.1f')} |")
@@ -349,7 +354,7 @@ def write_report(out_dir: Path, all_results: dict):
         ev = r.get("eval", {})
         ps = ev.get("per_slice_viol_rate", [])
         psf = "[" + ", ".join(f"{v:.3f}" for v in ps) + "]" if ps else "-"
-        md.append(f"| {r['seed']} | {'OK' if r['stable'] else 'unstable'} "
+        md.append(f"| {r['seed']} | {'✅' if r['stable'] else '❌'} "
                   f"| {_fmt(ev.get('most_constrained_slice_viol'))} "
                   f"| {_fmt(ev.get('aggregate_util'))} "
                   f"| {psf} | {_fmt(r.get('train_time_sec'), '.1f')} |")
@@ -365,7 +370,7 @@ def write_report(out_dir: Path, all_results: dict):
             ev = r.get("eval", {})
             ps = ev.get("per_slice_viol_rate", [])
             psf = "[" + ", ".join(f"{v:.3f}" for v in ps) + "]" if ps else "-"
-            md.append(f"| {r['seed']} | {'OK' if r['stable'] else 'unstable'} "
+            md.append(f"| {r['seed']} | {'✅' if r['stable'] else '❌'} "
                       f"| {_fmt(ev.get('most_constrained_slice_viol'))} "
                       f"| {_fmt(ev.get('aggregate_util'))} "
                       f"| {psf} | {_fmt(r.get('train_time_sec'), '.1f')} |")
@@ -387,7 +392,75 @@ def write_report(out_dir: Path, all_results: dict):
     md.append(json.dumps(TEMPLATES[all_results["template"]], indent=2))
     md.append("```")
 
-    (out_dir / "eval.md").write_text("\n".join(md), encoding="utf-8")
+    (out_dir / "REPORT.md").write_text("\n".join(md), encoding="utf-8")
+
+
+def write_manifest(out_dir: Path, all_results: dict):
+    """Top-level map of what's in this experiment directory. Read this first."""
+    md = []
+    md.append(f"# Experiment Manifest — {all_results.get('timestamp', '?')}")
+    md.append("")
+    md.append("This directory is a self-contained K=3 experiment run.")
+    md.append("Read REPORT.md for the decision; read files below for raw data.")
+    md.append("")
+    md.append("## Top-level files")
+    md.append("")
+    md.append("| File | Purpose |")
+    md.append("|---|---|")
+    md.append("| `REPORT.md` | Human-readable decision summary (**read this first**) |")
+    md.append("| `results.json` | Full aggregated metrics — what `REPORT.md` is built from |")
+    md.append("| `run_config.json` | Command-line args + template definitions + env versions |")
+    md.append("| `MANIFEST.md` | This file |")
+    md.append("| `runs/<mode>_seed<N>/` | Per-run artifacts (see below) |")
+    md.append("| `sanity/` | Template-C sanity run artifacts (if `--template C` or sanity triggered) |")
+    md.append("")
+    md.append("## Per-run directory layout")
+    md.append("")
+    md.append("Each `runs/<mode>_seed<N>/` contains:")
+    md.append("")
+    md.append("| File | Purpose |")
+    md.append("|---|---|")
+    md.append("| `<tag>_summary.json` | Per-run summary (status, stability, train time, final λ, eval summary, artifact list) |")
+    md.append("| `<tag>_training_log.jsonl` | **Streaming** one-line-per-update log (written during training; survives crash) |")
+    md.append("| `<tag>_training_log.json` | Same content as JSONL but as a single array (post-training dump) |")
+    md.append("| `<tag>_eval_trajectory.csv` | Deterministic eval: one row per env step (episode, step, action_k*, util_k*, viol_k*, reward, gamma, is_violation) |")
+    md.append("| `<tag>_eval_stochastic_trajectory.csv` | Same but stochastic policy (5 episodes) to see action spread |")
+    md.append("| `<tag>_ckpt_upd<NNNN>.pt` | Periodic mid-training checkpoint every 10 updates (crash safety) |")
+    md.append("| `<tag>_final.pt` | Final actor + critic + obs_rms + per_slice_r_rms + Lagrangian state |")
+    md.append("| `CRASH.txt` | Python traceback if training crashed |")
+    md.append("")
+    md.append("## How to analyze after the run")
+    md.append("")
+    md.append("Quick-look (one command, one terminal):")
+    md.append("")
+    md.append("```bash")
+    md.append("# Summary")
+    md.append("cat REPORT.md")
+    md.append("")
+    md.append("# Per-update training curves (pandas-friendly)")
+    md.append("python -c \"import pandas as pd, glob; "
+              "[print(f, pd.read_json(f, lines=True).tail(3)) "
+              "for f in sorted(glob.glob('runs/*/*_training_log.jsonl'))]\"")
+    md.append("")
+    md.append("# Per-step eval trajectory")
+    md.append("python -c \"import pandas as pd, glob; "
+              "[print(f, pd.read_csv(f).describe()) "
+              "for f in sorted(glob.glob('runs/*/*_eval_trajectory.csv'))]\"")
+    md.append("```")
+    md.append("")
+    md.append("## Zip & hand-off")
+    md.append("")
+    md.append("To send this run back to the Planning window, zip the whole directory:")
+    md.append("```bash")
+    md.append(f"tar czf k3_experiment_{all_results.get('timestamp', 'run')}.tgz .")
+    md.append("```")
+    md.append("")
+    md.append(f"**Timestamp**: {all_results.get('timestamp')}")
+    md.append(f"**Template**: {all_results.get('template')}")
+    md.append(f"**Seeds**: {all_results.get('seeds')}")
+    md.append(f"**Decision**: {all_results.get('decision', {}).get('decision', 'n/a')}")
+
+    (out_dir / "MANIFEST.md").write_text("\n".join(md), encoding="utf-8")
 
 
 # ============================================================
@@ -463,6 +536,14 @@ def main():
         print(f"\nSANITY: ATC stable {ok}/{args.seeds}")
         (out_dir / "sanity_results.json").write_text(
             json.dumps(sanity_atc, indent=2, default=str), encoding="utf-8")
+        # Write a minimal manifest even in sanity-only mode
+        (out_dir / "MANIFEST.md").write_text(
+            f"# Sanity-only run — {ts}\n\n"
+            f"Template C, {args.seeds} ATC seeds, {args.steps // 2} steps each.\n"
+            f"Stable seeds: {ok}/{args.seeds}\n\n"
+            f"Per-run artifacts under `sanity/runs/<mode>_seed<N>/`.\n"
+            f"Aggregate: `sanity_results.json`.\n",
+            encoding="utf-8")
         if ok < 2:
             print("!!! SANITY FAILED — investigate before running Template A")
         return
@@ -536,12 +617,14 @@ def main():
     (out_dir / "results.json").write_text(json.dumps(all_results, indent=2, default=str),
                                           encoding="utf-8")
     write_report(out_dir, all_results)
+    write_manifest(out_dir, all_results)
 
     print("\n" + "=" * 60)
     print(f">>> DECISION: {decision['decision']}")
     print(f"    Reason: {decision['reason']}")
     print(f"    Wall time: {wall/60:.1f} min")
-    print(f"    Eval:     {out_dir / 'eval.md'}")
+    print(f"    Report:   {out_dir / 'REPORT.md'}")
+    print(f"    Manifest: {out_dir / 'MANIFEST.md'}  <- start here when analyzing")
     print("=" * 60)
 
 

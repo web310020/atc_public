@@ -1,11 +1,14 @@
 """
-性能分布图: 单列 2 panel CDF (左 Saturation, 右 Violation Depth).
+plot_perf_distributions.py — NEW Fig 3 (lean-6 design)
 
-数据: 复用 auto_plot_v2.py 用的 K=1 main-run rollout.
+Single-col 2-panel CDF: Saturation (left) + Violation Depth (right).
+Replaces the 1x4 figure* horizontal subfig layout in current Fig 4
+(drops fidelity + scores subfigs; merges saturation_cdf + violation_depth into 2-panel).
 
-Usage:
-    python -m fig.plot_perf_distributions
+Data: same K=1 main-run rollouts used by auto_plot_v2.py.
+We re-use auto_plot_v2's data collection but plot in 2-panel single-col.
 
+Usage: cd papers_src/belief_v3 && python -m fig.plot_perf_distributions
 Output: paper_draft/figures/fig_perf_distributions.pdf + .png
 """
 import os, glob, json
@@ -53,8 +56,8 @@ PAPER_FIG_DIR = "paper_draft/figures" if os.path.isdir("paper_draft/figures") \
 
 
 METHOD_STYLE = {
-    # The "oracle" mode key is the zero-delay (D=0) full-information reference.
-    "oracle":          {"label": "FullInfo-PPO ($D{=}0$)", "color": "black",   "ls": "--", "lw": 1.5, "alpha":0.7},
+    # Baseline: MatchedRef-PPO (D=0) is the zero-delay full-information reference
+    "oracle":          {"label": "MatchedRef-PPO ($D{=}0$)", "color": "black",   "ls": "--", "lw": 1.5, "alpha":0.7},
     "proposed":        {"label": r"\textbf{ATC (Ours)}",  "color": "#d62728", "ls": "-",  "lw": 2.0, "alpha":0.7},
     "lstm_predictive": {"label": "LSTM-Pred",             "color": "#1f77b4", "ls": "-.", "lw": 1.3, "alpha":0.7},
     "vanilla_ppo":     {"label": "Vanilla-PPO",           "color": "#2ca02c", "ls": ":",  "lw": 1.3, "alpha":0.7},
@@ -65,7 +68,7 @@ ROLLOUT_LEN = 10000
 
 
 def find_K1_main():
-    _K1_EXCLUDE = ("k3_", "k5_", "k_exploration", "sanity", "decision", "seedbump", "probe")
+    _K1_EXCLUDE = ("k3_", "k5_", "k_exploration", "sanity", "decision", "seedbump", "probe", "beta_tuned", "bestref", "multiseed", "path_gamma", "l3_", "ablations", "habib")
     candidates = glob.glob("experiments/*")
     k1_dirs = [e for e in candidates if not any(kw in os.path.basename(e) for kw in _K1_EXCLUDE)]
     if not k1_dirs:
@@ -122,7 +125,7 @@ def plot_2panel(data, tau, out_dir):
         u = np.sort(d["U"])
         cdf = np.arange(1, len(u) + 1) / len(u)
         cfg = METHOD_STYLE[mode]
-        ax_l.plot(u, cdf, label=cfg["label"], color=cfg["color"], ls=cfg["ls"], lw=cfg["lw"])
+        ax_l.plot(u, cdf, label=cfg["label"], color=cfg["color"], ls=cfg["ls"], lw=cfg["lw"], alpha=cfg.get("alpha", 0.8))
     ax_l.axvline(tau, color="#d62728", linestyle=":", lw=0.9, alpha=0.5)
     ax_l.text(tau + 0.02, 0.05, r"SLA $\tau$", color="#d62728", fontsize=6.5)
     ax_l.set_xlabel(r"Saturation $U_t$")
@@ -143,8 +146,8 @@ def plot_2panel(data, tau, out_dir):
         s = np.sort(nonzero)
         cdf = np.arange(1, len(s) + 1) / len(s)
         cfg = METHOD_STYLE[mode]
-        ax_r.plot(s, cdf, label=cfg["label"], color=cfg["color"], ls=cfg["ls"], lw=cfg["lw"])
-    # Use psi for violation depth to avoid overloading delta_t (tactical-slot length).
+        ax_r.plot(s, cdf, label=cfg["label"], color=cfg["color"], ls=cfg["ls"], lw=cfg["lw"], alpha=cfg.get("alpha", 0.8))
+    # psi = violation depth (paper notation; avoids overload with delta_t = tactical-slot length)
     ax_r.set_xlabel(r"Violation depth $\psi$")
     ax_r.set_ylabel(r"$F(\psi)$")
     ax_r.set_xlim(0, 0.12)
@@ -159,7 +162,7 @@ def plot_2panel(data, tau, out_dir):
         "LSTM-Pred": 1,
         "Vanilla-PPO": 2,
         "SafeSlice": 3,
-        r"FullInfo-PPO ($D{=}0$ ref.)": 4,  # 设置为最大值，排在最后
+        r"MatchedRef-PPO ($D{=}0$)": 4,  # 设置为最大值，排在最后
     }
     # --- 3. 执行排序 ---
     new_handles_labels = sorted(zip(handles, labels), key=lambda x: order_map.get(x[1], 99))

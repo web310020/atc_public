@@ -1,13 +1,12 @@
 # core/k3_dirichlet_ppo.py
 # ============================================================
-# 多 slice 版本的 Dirichlet-policy PPO + per-slice Lagrangian.
-#
-# 主要组件:
-#   - Dirichlet policy head (action 落在 simplex 上)
-#   - Per-slice reward normalization (每个 slice 自己的 RunningMeanStd)
-#   - Per-slice Lagrangian (K 个 dual variable, 每个 SLA budget 一个)
-#
-# 可选: 用 `load_warmstart_checkpoint` 从已训练好的 checkpoint warm-start.
+# K=3 Dirichlet-Policy PPO with Per-Slice Lagrangian
+# ============================================================
+# Applies TOP-3 fixes from Belief_K3_algorithm_recommendations_20260424.md:
+#   Fix 1: Dirichlet policy head (replaces softmax / Gaussian-Box)
+#   Fix 3a: Per-slice reward normalization (RunningMeanStd per slice)
+#   Fix 3b: Per-slice Lagrangian (K dual variables, one per SLA)
+# Warm-start (Fix 2) is optional; see `load_warmstart_checkpoint`.
 # ============================================================
 
 import csv
@@ -191,6 +190,42 @@ class PerSliceLagrangian:
         self.lam_max = d["lam_max"]
 
 
+class GlobalSafeSliceLagrangian:
+    """SafeSlice-style single global Lagrangian (CPO descendant per [SafeSlice_2025]).
+
+    Unlike PerSliceLagrangian (K independent duals), maintains a single scalar lambda
+    that ascends on aggregate (mean across slices) violation rate. This is a faithful
+    reproduction of the [SafeSlice_2025] grid-searched Lagrangian formulation: the
+    constraint signal is observation-conditioned (mean over per-slice violations), so
+    under stale telemetry the dual update lacks the per-slice resolution of ATC's mu_k
+    ascent and the policy collapses into the conservatism trap predicted in section II.B.
+    """
+    def __init__(self, sla_budget_global: float = 0.05, lr_dual: float = 1e-3,
+                 lam_init: float = 0.0, lam_max: float = 100.0):
+        self.sla_budget_global = float(sla_budget_global)
+        self.lr_dual = float(lr_dual)
+        self.lam = float(lam_init)
+        self.lam_max = float(lam_max)
+        self.history = []
+
+    def update(self, per_slice_violation_rate):
+        mean_viol = float(np.mean(per_slice_violation_rate))
+        excess = mean_viol - self.sla_budget_global
+        self.lam = float(np.clip(self.lam + self.lr_dual * excess, 0.0, self.lam_max))
+        self.history.append({"lam": self.lam, "mean_viol": mean_viol,
+                             "excess": float(excess)})
+
+    def state_dict(self):
+        return {"lam": self.lam, "sla_budget_global": self.sla_budget_global,
+                "lr_dual": self.lr_dual, "lam_max": self.lam_max}
+
+    def load_state_dict(self, d):
+        self.lam = float(d["lam"])
+        self.sla_budget_global = float(d["sla_budget_global"])
+        self.lr_dual = float(d["lr_dual"])
+        self.lam_max = float(d["lam_max"])
+
+
 # ============================================================
 # Rollout buffer
 # ============================================================
@@ -256,6 +291,7 @@ class K3DirichletPPO:
         normalize_obs: bool = True,
         normalize_per_slice_rewards: bool = True,
         use_lagrangian: bool = True,
+        safeslice_mode: bool = False,
         seed: int = 0,
         verbose: bool = True,
         log_dir: Optional[str] = None,            # if set, stream per-update logs to disk
@@ -302,11 +338,22 @@ class K3DirichletPPO:
         self.batch_size = batch_size
         self.verbose = verbose
         self.use_lagrangian = use_lagrangian
+        self.safeslice_mode = safeslice_mode
 
         self.obs_rms = RunningMeanStd(shape=(self.obs_dim,)) if normalize_obs else None
         self.per_slice_r_rms = [RunningMeanStd() for _ in range(K)] if normalize_per_slice_rewards else None
-        self.lagrangian = PerSliceLagrangian(K=K, sla_budget=np.asarray(sla_budget),
-                                             lr_dual=lr_dual) if use_lagrangian else None
+        if safeslice_mode:
+            # SafeSlice: single global Lagrangian on aggregate violation (CPO descendant).
+            # Mutually exclusive with per-slice Lagrangian (which is ATC's distinguishing mechanism).
+            sla_budget_global = float(np.mean(np.asarray(sla_budget, dtype=np.float64)))
+            self.lagrangian = None
+            self.use_lagrangian = False
+            self.safeslice_lagrangian = GlobalSafeSliceLagrangian(
+                sla_budget_global=sla_budget_global, lr_dual=lr_dual)
+        else:
+            self.lagrangian = PerSliceLagrangian(K=K, sla_budget=np.asarray(sla_budget),
+                                                 lr_dual=lr_dual) if use_lagrangian else None
+            self.safeslice_lagrangian = None
 
         self.global_step = 0
         self.update_idx = 0
@@ -334,6 +381,9 @@ class K3DirichletPPO:
             base = float(raw_reward)
         if self.lagrangian is not None:
             base = base - float((self.lagrangian.lam * per_slice_violation).sum())
+        elif self.safeslice_lagrangian is not None:
+            # SafeSlice: subtract single global lambda * mean(per-slice violation)
+            base = base - float(self.safeslice_lagrangian.lam * np.mean(per_slice_violation))
         return float(base)
 
     def collect_rollout(self) -> Rollout:
@@ -459,6 +509,9 @@ class K3DirichletPPO:
         if self.lagrangian is not None:
             mean_viol = arr["per_slice_violations"].mean(axis=0)
             self.lagrangian.update(mean_viol)
+        elif self.safeslice_lagrangian is not None:
+            mean_viol = arr["per_slice_violations"].mean(axis=0)
+            self.safeslice_lagrangian.update(mean_viol)
 
         self.update_idx += 1
         log = {
@@ -476,7 +529,11 @@ class K3DirichletPPO:
             "per_slice_viol_rate": arr["per_slice_violations"].mean(axis=0).tolist(),
             "per_slice_mean_util": arr["true_util"].mean(axis=0).tolist(),
             "per_slice_mean_reward": arr["per_slice_rewards"].mean(axis=0).tolist(),
-            "lambda": (self.lagrangian.lam.tolist() if self.lagrangian else [0.0] * self.K),
+            "lambda": (
+                self.lagrangian.lam.tolist() if self.lagrangian
+                else ([self.safeslice_lagrangian.lam] if self.safeslice_lagrangian
+                      else [0.0] * self.K)
+            ),
         }
         self.train_log.append(log)
         # Stream to disk so we don't lose anything if the run crashes.
@@ -600,6 +657,8 @@ class K3DirichletPPO:
             "per_slice_r_rms": ([r.state_dict() for r in self.per_slice_r_rms]
                                 if self.per_slice_r_rms else None),
             "lagrangian": self.lagrangian.state_dict() if self.lagrangian else None,
+            "safeslice_lagrangian": (self.safeslice_lagrangian.state_dict()
+                                     if self.safeslice_lagrangian else None),
             "cfg": {k: v for k, v in self.cfg.items()
                     if isinstance(v, (int, float, str, bool, list, tuple, type(None)))},
             "global_step": self.global_step,
@@ -618,6 +677,8 @@ class K3DirichletPPO:
                 r.load_state_dict(d)
         if self.lagrangian and ckpt.get("lagrangian"):
             self.lagrangian.load_state_dict(ckpt["lagrangian"])
+        if self.safeslice_lagrangian and ckpt.get("safeslice_lagrangian"):
+            self.safeslice_lagrangian.load_state_dict(ckpt["safeslice_lagrangian"])
         self.global_step = ckpt.get("global_step", 0)
         self.update_idx = ckpt.get("update_idx", 0)
 
